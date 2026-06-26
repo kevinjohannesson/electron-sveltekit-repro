@@ -221,7 +221,12 @@ win.webContents.on('will-prevent-unload', (event) => {
     message: 'Are you sure you want to quit?',
     detail: 'Unsaved changes will be lost.'
   });
-  if (choice === 1) event.preventDefault(); // Quit -> ALLOW the close
+  if (choice === 1) {
+    event.preventDefault(); // Quit -> ALLOW the close
+  } else if (process.platform === 'win32') {
+    // Cancel -> window stays; showMessageBoxSync re-triggered the focus bug. Re-fix it.
+    setImmediate(() => { win.blur(); win.focus(); });
+  }
 });
 ```
 
@@ -230,12 +235,15 @@ actually complete the close. The default is "Cancel" (safe — accidental Esc/cl
 It works regardless of how the guards are written (`returnValue` or `confirm`), so **you don't touch
 the ~19 call sites.**
 
-**Caveat (and the async alternative):** `showMessageBoxSync` is a synchronous native dialog — same
-*family* as the original focus bug. On **Quit** the window closes (no issue); on **Cancel** the window
-stays and that sync dialog can leave inputs unfocused (your monkey-patch covers `confirm/alert/prompt`,
-not `showMessageBoxSync`). If you see that, call `refocus()` after, or use the async variant: intercept
-`win.on('close')` with a dirty flag the renderer reports, `e.preventDefault()`, show async
-`dialog.showMessageBox`, then `win.destroy()` on confirm.
+**Why the Cancel branch re-applies blur+focus:** `showMessageBoxSync` is itself a native dialog, so on
+**Cancel** (window stays) it re-triggers the original focus bug — and your renderer monkey-patch only
+covers `confirm/alert/prompt`, not `showMessageBoxSync`. So restore focus from main on Cancel. On
+**Quit** the window closes, so nothing to fix.
+
+**Fully clean alternative (no native dialog at all):** intercept `win.on('close')` with a dirty flag
+the renderer reports, `e.preventDefault()`, show **async** `dialog.showMessageBox`, then `win.destroy()`
+on confirm. Async dialogs don't trigger the focus bug, so there's no Cancel re-fix needed — but it
+requires the renderer to report dirty state to main (more plumbing).
 - ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses the unsaved-changes guards.
 
 **UX note (consistency):** the close prompt is an OS-native message box, while in-app

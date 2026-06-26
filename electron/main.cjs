@@ -29,7 +29,17 @@ function createWindow() {
       message: 'Are you sure you want to quit?',
       detail: 'Unsaved changes will be lost.'
     });
-    if (choice === 1) event.preventDefault(); // Quit -> allow the close
+    if (choice === 1) {
+      event.preventDefault(); // Quit -> allow the close
+    } else if (process.platform === 'win32') {
+      // Cancel -> window stays open. showMessageBoxSync is itself a native dialog,
+      // so it leaves the renderer unfocusable (the same Windows bug). Re-apply the
+      // blur+focus fix on the next tick to restore input focus.
+      setImmediate(() => {
+        win.blur();
+        win.focus();
+      });
+    }
   });
 }
 
