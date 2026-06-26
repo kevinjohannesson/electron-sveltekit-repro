@@ -207,12 +207,21 @@ X / taskbar-Close / Alt+F4 all behave identically because they all route through
 
 **The fix — add ONE handler in the main process. Change none of your `beforeunload` guards.**
 
+Use the **async** `dialog.showMessageBox` (not `showMessageBoxSync`). A sync dialog is itself a native
+modal and re-triggers the focus bug on Cancel (and patching that with a timed `blur()/focus()` is a
+race — fragile on slow/large apps and slow machines). The async dialog avoids the focus bug entirely:
+
 ```js
 // MAIN process, where you create the window
 const { dialog } = require('electron');
 
+let quitting = false;
+let prompting = false;
 win.webContents.on('will-prevent-unload', (event) => {
-  const choice = dialog.showMessageBoxSync(win, {
+  if (quitting) { event.preventDefault(); return; } // already confirmed -> allow close
+  if (prompting) return;                             // a prompt is already open
+  prompting = true;
+  dialog.showMessageBox(win, {
     type: 'question',
     buttons: ['Cancel', 'Quit'],
     defaultId: 0,
@@ -220,31 +229,24 @@ win.webContents.on('will-prevent-unload', (event) => {
     title: 'Quit',
     message: 'Are you sure you want to quit?',
     detail: 'Unsaved changes will be lost.'
+  }).then(({ response }) => {
+    prompting = false;
+    if (response === 1) { quitting = true; win.close(); } // re-trigger; flag lets it through
   });
-  if (choice === 1) {
-    event.preventDefault(); // Quit -> ALLOW the close
-  } else if (process.platform === 'win32') {
-    // Cancel -> window stays; showMessageBoxSync re-triggered the focus bug. Re-fix it.
-    setImmediate(() => { win.blur(); win.focus(); });
-  }
 });
 ```
 
-Your existing guards already veto the unload; this handler turns that veto into a real prompt that can
-actually complete the close. The default is "Cancel" (safe — accidental Esc/close won't lose data).
-It works regardless of how the guards are written (`returnValue` or `confirm`), so **you don't touch
-the ~19 call sites.**
+How it works: when a guard vetoes the unload, `will-prevent-unload` fires. We do **not** `preventDefault`
+immediately, so the window stays open while we ask asynchronously (no focus bug). On **Quit** we set a
+flag and call `win.close()` again — `will-prevent-unload` fires once more, the flag lets us `preventDefault`
+(= allow the unload), and the window closes. On **Cancel** nothing happens and the window stays. Default
+is "Cancel" (accidental Esc/close won't lose data). Works regardless of how the guards veto
+(`returnValue` or `confirm`), so **you don't touch the ~19 call sites**, and there's **no timer**.
 
-**Why the Cancel branch re-applies blur+focus:** `showMessageBoxSync` is itself a native dialog, so on
-**Cancel** (window stays) it re-triggers the original focus bug — and your renderer monkey-patch only
-covers `confirm/alert/prompt`, not `showMessageBoxSync`. So restore focus from main on Cancel. On
-**Quit** the window closes, so nothing to fix.
-
-**Fully clean alternative (no native dialog at all):** intercept `win.on('close')` with a dirty flag
-the renderer reports, `e.preventDefault()`, show **async** `dialog.showMessageBox`, then `win.destroy()`
-on confirm. Async dialogs don't trigger the focus bug, so there's no Cancel re-fix needed — but it
-requires the renderer to report dirty state to main (more plumbing).
+- ❌ Do **not** use `showMessageBoxSync` here — it re-triggers the focus bug on Cancel and a timed
+  blur/focus to patch it is a race condition.
 - ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses the unsaved-changes guards.
+  (Here we re-trigger the *guarded* `win.close()`, so the guards still run; the flag just lets it through.)
 
 **UX note (consistency):** the close prompt is an OS-native message box, while in-app
 route-change prompts use `window.confirm` (OK/Cancel) — they look different because `window.confirm`

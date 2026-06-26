@@ -15,31 +15,38 @@ function createWindow() {
 
   win.loadURL(DEV_URL);
 
-  // When a renderer beforeunload guard vetoes the close, Electron does nothing by
-  // default (window stays, no dialog). Handle it here: show the quit confirmation
-  // and call event.preventDefault() to ALLOW the close when the user confirms.
-  // Keeps all renderer-side "unsaved changes" guards unchanged.
+  // When a renderer beforeunload guard vetoes the close, Electron won't close the
+  // window unless we handle this event. We deliberately do NOT preventDefault right
+  // away — that keeps the window open while we ask ASYNCHRONOUSLY. Using the async
+  // dialog (not showMessageBoxSync) avoids the native-modal focus bug entirely, so
+  // there's no blur+focus / timer needed on Cancel. On "Quit" we set a flag and
+  // re-trigger the close, which is then allowed through. Renderer guards unchanged.
+  let quitting = false;
+  let prompting = false;
   win.webContents.on('will-prevent-unload', (event) => {
-    const choice = dialog.showMessageBoxSync(win, {
-      type: 'question',
-      buttons: ['Cancel', 'Quit'],
-      defaultId: 0,
-      cancelId: 0,
-      title: 'Quit',
-      message: 'Are you sure you want to quit?',
-      detail: 'Unsaved changes will be lost.'
-    });
-    if (choice === 1) {
-      event.preventDefault(); // Quit -> allow the close
-    } else if (process.platform === 'win32') {
-      // Cancel -> window stays open. showMessageBoxSync is itself a native dialog,
-      // so it leaves the renderer unfocusable (the same Windows bug). Re-apply the
-      // blur+focus fix on the next tick to restore input focus.
-      setImmediate(() => {
-        win.blur();
-        win.focus();
-      });
+    if (quitting) {
+      event.preventDefault(); // already confirmed -> allow the close
+      return;
     }
+    if (prompting) return; // a prompt is already open; ignore repeat close attempts
+    prompting = true;
+    dialog
+      .showMessageBox(win, {
+        type: 'question',
+        buttons: ['Cancel', 'Quit'],
+        defaultId: 0,
+        cancelId: 0,
+        title: 'Quit',
+        message: 'Are you sure you want to quit?',
+        detail: 'Unsaved changes will be lost.'
+      })
+      .then(({ response }) => {
+        prompting = false;
+        if (response === 1) {
+          quitting = true;
+          win.close(); // re-trigger the close; the quitting flag lets it through
+        }
+      });
   });
 }
 
