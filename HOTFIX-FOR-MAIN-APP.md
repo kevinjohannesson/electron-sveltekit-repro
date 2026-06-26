@@ -189,7 +189,69 @@ or an async `dialog.showMessageBox` over IPC. **Both require call sites to becom
 
 ---
 
-## 6. Verify (on Windows)
+## 6. Second symptom: the app becomes unclosable after the bug (separate cause + fix)
+
+**Symptom:** once the bug is triggered, the app can no longer be closed via the title-bar X,
+taskbar right-click → Close, or Alt+F4. The blur+focus hotfix does **not** help here.
+
+**Root cause (proven by source analysis — a different failure from the focus bug):**
+X / taskbar-Close / Alt+F4 all send the same Win32 `WM_CLOSE` → Electron `'close'` →
+the renderer's `beforeunload`. SvelteKit runs **every `beforeNavigate` callback on `beforeunload`**
+as a `'leave'` navigation with `navigation.willUnload === true`. If that callback shows a `confirm`
+and calls `navigation.cancel()` when it isn't confirmed, SvelteKit calls `event.preventDefault()` on
+the unload — and **since Electron v25, `preventDefault()` in `beforeunload` cancels the window close**
+(electron/electron#38798; you are on Electron 42). On unload the confirm resolves to `false`
+(Chromium suppresses unload-phase dialogs, and the broken focus state seals it), so the close is
+vetoed every time → unclosable.
+
+**Why blur+focus can't fix it:** the veto is decided by the confirm's return value, consumed
+synchronously by SvelteKit's `beforeunload` handler **before** the async refocus IPC reaches main;
+and blur/focus only changes activation, not the unload veto. (A brief window "flash" on clicking X is
+the blur+focus firing on the close-time confirm — turn the focus-fix off and the flash goes but the
+window still won't close, proving the veto is separate.)
+
+**Check in the production codebase:** grep for `beforeunload`, `beforeNavigate`, `win.on('close'`,
+`before-quit`, and `showMessageBoxSync`. Any unload/close guard that runs a **synchronous** confirm
+or `cancel()` is the culprit.
+
+**The fix — move quit-confirmation off the renderer unload path into an async main-process dialog:**
+
+```js
+// MAIN process
+const { dialog } = require('electron');
+let allowClose = false;
+
+win.on('close', (e) => {
+  if (allowClose || !hasUnsavedChanges()) return; // nothing to confirm -> let it close
+  e.preventDefault();
+  dialog.showMessageBox(win, {
+    type: 'question',
+    buttons: ['Cancel', 'Leave'],
+    defaultId: 1,
+    cancelId: 0,
+    message: 'You have unsaved changes. Leave anyway?'
+  }).then(({ response }) => {
+    if (response === 1) { allowClose = true; win.destroy(); }
+  });
+});
+```
+
+Then remove the synchronous `confirm` from any `beforeunload`/`beforeNavigate` unload guard (or in
+SvelteKit, early-return when `navigation.willUnload` / `navigation.type === 'leave'`).
+
+**Data-loss traps to avoid:**
+- ❌ Do **not** just swap the renderer `confirm` for an async one. `beforeunload`/`beforeNavigate` are
+  synchronous and can't `await`; an async confirm returns a Promise (always truthy), so
+  `if (!leave) cancel()` never runs and the window closes **ignoring unsaved changes**.
+- ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses all guards. Use it only
+  *after* the async confirm resolves to "Leave."
+- If the app confirms-on-quit via a main-process **`showMessageBoxSync`**, that's the Theory-B variant
+  (sync native modal can leave the window disabled). Same fix direction: async dialog + `destroy()`.
+
+**Repro confirmation:** on `/form`, uncheck "beforeNavigate guard", trigger the bug, click X — it
+closes. That isolates the veto to the `beforeNavigate`-on-unload `cancel()`.
+
+## 7. Verify (on Windows)
 
 1. Run the app on Windows.
 2. Trigger any `confirm`/`alert`, dismiss it.

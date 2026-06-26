@@ -14,14 +14,20 @@
   // monkey-patching window.confirm/alert/prompt, so every call site below is
   // covered automatically. The toggle/method UI just drives the shared config.
 
+  // Experiment toggle: beforeNavigate ALSO fires on real window close/reload
+  // (navigation.willUnload === true). Turn this OFF to remove the close-time
+  // confirm and see whether the "can't close the app" symptom disappears.
+  let navGuard = $state(true);
+
   /**
    * Fires before any navigation away from this page: clicking a SPA link,
-   * back/forward, goto(), or a real unload (reload / close). Calling
+   * back/forward, goto(), or a real unload (reload / close / X button). Calling
    * navigation.cancel() blocks it.
    *   - confirm() === true  (OK / Leave)   -> do nothing -> navigation proceeds
    *   - confirm() === false (Cancel)        -> navigation.cancel() -> blocked
    */
   beforeNavigate((navigation) => {
+    if (!navGuard) return; // experiment: no close-time confirm/veto
     const leave = window.confirm('You have unsaved changes. Leave anyway?');
     if (!leave) {
       navigation.cancel();
@@ -74,6 +80,10 @@
       <option value="relayout">webContents.focus() + relayout — no flash</option>
       <option value="blurFocus">blur + focus — flashes, most reliable</option>
     </select>
+  </label>
+  <label class="patch">
+    <input type="checkbox" bind:checked={navGuard} />
+    beforeNavigate guard (confirm on leave/close) — uncheck to test the "can't close" symptom
   </label>
 </section>
 
