@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('node:path');
 
 // Electron loads the SvelteKit dev server. Override with DEV_URL if you change the port.
@@ -14,6 +14,23 @@ function createWindow() {
   });
 
   win.loadURL(DEV_URL);
+
+  // When a renderer beforeunload guard vetoes the close, Electron does nothing by
+  // default (window stays, no dialog). Handle it here: show the quit confirmation
+  // and call event.preventDefault() to ALLOW the close when the user confirms.
+  // Keeps all renderer-side "unsaved changes" guards unchanged.
+  win.webContents.on('will-prevent-unload', (event) => {
+    const choice = dialog.showMessageBoxSync(win, {
+      type: 'question',
+      buttons: ['Cancel', 'Quit'],
+      defaultId: 0,
+      cancelId: 0,
+      title: 'Quit',
+      message: 'Are you sure you want to quit?',
+      detail: 'Unsaved changes will be lost.'
+    });
+    if (choice === 1) event.preventDefault(); // Quit -> allow the close
+  });
 }
 
 // --- Windows focus-fix workaround -------------------------------------------

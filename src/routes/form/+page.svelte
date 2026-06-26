@@ -27,11 +27,16 @@
    *   - confirm() === false (Cancel)        -> navigation.cancel() -> blocked
    */
   beforeNavigate((navigation) => {
-    if (!navGuard) return; // experiment: no close-time confirm/veto
-    const leave = window.confirm('You have unsaved changes. Leave anyway?');
-    if (!leave) {
+    if (!navGuard) return;
+    if (navigation.willUnload) {
+      // Real close/reload: window.confirm is suppressed here, so just veto. The
+      // main-process will-prevent-unload handler shows the quit dialog and
+      // completes the close. (Mirrors a typical "unsaved changes" guard.)
       navigation.cancel();
+      return;
     }
+    const leave = window.confirm('You have unsaved changes. Leave anyway?');
+    if (!leave) navigation.cancel();
   });
 
   // --- Isolation test: fire a native dialog WITHOUT any navigation ---------
@@ -83,7 +88,7 @@
   </label>
   <label class="patch">
     <input type="checkbox" bind:checked={navGuard} />
-    beforeNavigate guard (confirm on leave/close) — uncheck to test the "can't close" symptom
+    Unsaved-changes guard (simulates your 19 beforeunload guards; vetoes close → main shows the Leave dialog)
   </label>
 </section>
 

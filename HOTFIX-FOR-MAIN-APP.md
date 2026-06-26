@@ -189,67 +189,62 @@ or an async `dialog.showMessageBox` over IPC. **Both require call sites to becom
 
 ---
 
-## 6. Second symptom: the app becomes unclosable after the bug (separate cause + fix)
+## 6. Second symptom: the app can't be closed (separate cause + 1-line fix)
 
-**Symptom:** once the bug is triggered, the app can no longer be closed via the title-bar X,
-taskbar right-click → Close, or Alt+F4. The blur+focus hotfix does **not** help here.
+**Symptom:** the app can't be closed via the title-bar X, taskbar right-click → Close, or Alt+F4 —
+and **no dialog appears**. The blur+focus hotfix does not affect this (different layer).
 
-**Root cause (proven by source analysis — a different failure from the focus bug):**
-X / taskbar-Close / Alt+F4 all send the same Win32 `WM_CLOSE` → Electron `'close'` →
-the renderer's `beforeunload`. SvelteKit runs **every `beforeNavigate` callback on `beforeunload`**
-as a `'leave'` navigation with `navigation.willUnload === true`. If that callback shows a `confirm`
-and calls `navigation.cancel()` when it isn't confirmed, SvelteKit calls `event.preventDefault()` on
-the unload — and **since Electron v25, `preventDefault()` in `beforeunload` cancels the window close**
-(electron/electron#38798; you are on Electron 42). On unload the confirm resolves to `false`
-(Chromium suppresses unload-phase dialogs, and the broken focus state seals it), so the close is
-vetoed every time → unclosable.
+**Root cause (proven by logging the close path — NOT related to the focus bug):**
+the app's `beforeunload` "unsaved changes" guards veto the unload (correct). But **by default,
+Electron silently refuses to close and shows no dialog when a renderer `beforeunload` guard vetoes —
+unless the main process handles the `webContents` `will-prevent-unload` event.** With no such handler,
+the veto just becomes "window won't close, no prompt." (Note: `window.confirm` is also *suppressed*
+during the unload phase and returns `false`, so any guard that relies on it always vetoes — which is
+why removing the guards "fixes" closing but loses the warning.)
 
-**Why blur+focus can't fix it:** the veto is decided by the confirm's return value, consumed
-synchronously by SvelteKit's `beforeunload` handler **before** the async refocus IPC reaches main;
-and blur/focus only changes activation, not the unload veto. (A brief window "flash" on clicking X is
-the blur+focus firing on the close-time confirm — turn the focus-fix off and the flash goes but the
-window still won't close, proving the veto is separate.)
+X / taskbar-Close / Alt+F4 all behave identically because they all route through the same
+`WM_CLOSE` → Electron `'close'` → renderer `beforeunload` path.
 
-**Check in the production codebase:** grep for `beforeunload`, `beforeNavigate`, `win.on('close'`,
-`before-quit`, and `showMessageBoxSync`. Any unload/close guard that runs a **synchronous** confirm
-or `cancel()` is the culprit.
-
-**The fix — move quit-confirmation off the renderer unload path into an async main-process dialog:**
+**The fix — add ONE handler in the main process. Change none of your `beforeunload` guards.**
 
 ```js
-// MAIN process
+// MAIN process, where you create the window
 const { dialog } = require('electron');
-let allowClose = false;
 
-win.on('close', (e) => {
-  if (allowClose || !hasUnsavedChanges()) return; // nothing to confirm -> let it close
-  e.preventDefault();
-  dialog.showMessageBox(win, {
+win.webContents.on('will-prevent-unload', (event) => {
+  const choice = dialog.showMessageBoxSync(win, {
     type: 'question',
-    buttons: ['Cancel', 'Leave'],
-    defaultId: 1,
+    buttons: ['Cancel', 'Quit'],
+    defaultId: 0,
     cancelId: 0,
-    message: 'You have unsaved changes. Leave anyway?'
-  }).then(({ response }) => {
-    if (response === 1) { allowClose = true; win.destroy(); }
+    title: 'Quit',
+    message: 'Are you sure you want to quit?',
+    detail: 'Unsaved changes will be lost.'
   });
+  if (choice === 1) event.preventDefault(); // Quit -> ALLOW the close
 });
 ```
 
-Then remove the synchronous `confirm` from any `beforeunload`/`beforeNavigate` unload guard (or in
-SvelteKit, early-return when `navigation.willUnload` / `navigation.type === 'leave'`).
+Your existing guards already veto the unload; this handler turns that veto into a real prompt that can
+actually complete the close. The default is "Cancel" (safe — accidental Esc/close won't lose data).
+It works regardless of how the guards are written (`returnValue` or `confirm`), so **you don't touch
+the ~19 call sites.**
 
-**Data-loss traps to avoid:**
-- ❌ Do **not** just swap the renderer `confirm` for an async one. `beforeunload`/`beforeNavigate` are
-  synchronous and can't `await`; an async confirm returns a Promise (always truthy), so
-  `if (!leave) cancel()` never runs and the window closes **ignoring unsaved changes**.
-- ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses all guards. Use it only
-  *after* the async confirm resolves to "Leave."
-- If the app confirms-on-quit via a main-process **`showMessageBoxSync`**, that's the Theory-B variant
-  (sync native modal can leave the window disabled). Same fix direction: async dialog + `destroy()`.
+**Caveat (and the async alternative):** `showMessageBoxSync` is a synchronous native dialog — same
+*family* as the original focus bug. On **Quit** the window closes (no issue); on **Cancel** the window
+stays and that sync dialog can leave inputs unfocused (your monkey-patch covers `confirm/alert/prompt`,
+not `showMessageBoxSync`). If you see that, call `refocus()` after, or use the async variant: intercept
+`win.on('close')` with a dirty flag the renderer reports, `e.preventDefault()`, show async
+`dialog.showMessageBox`, then `win.destroy()` on confirm.
+- ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses the unsaved-changes guards.
 
-**Repro confirmation:** on `/form`, uncheck "beforeNavigate guard", trigger the bug, click X — it
-closes. That isolates the veto to the `beforeNavigate`-on-unload `cancel()`.
+**UX note (consistency):** the close prompt is an OS-native message box, while in-app
+route-change prompts use `window.confirm` (OK/Cancel) — they look different because `window.confirm`
+can't run during a real close. Unifying them means moving everything to one custom in-DOM modal — which
+is the same as the §5 sustainable fix and *also* eliminates the focus bug (no native dialogs left).
+
+**Repro confirmation:** on `/form` with the guard on, click X → you get the Quit dialog and Quit
+closes the app; the 19-style guards are untouched.
 
 ## 7. Verify (on Windows)
 
