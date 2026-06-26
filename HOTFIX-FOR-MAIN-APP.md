@@ -205,11 +205,35 @@ why removing the guards "fixes" closing but loses the warning.)
 X / taskbar-Close / Alt+F4 all behave identically because they all route through the same
 `WM_CLOSE` → Electron `'close'` → renderer `beforeunload` path.
 
-**The fix — add ONE handler in the main process. Change none of your `beforeunload` guards.**
+There are two fixes, depending on whether you want to keep the close-time warning.
 
-Use the **async** `dialog.showMessageBox` (not `showMessageBoxSync`). A sync dialog is itself a native
-modal and re-triggers the focus bug on Cancel (and patching that with a timed `blur()/focus()` is a
-race — fragile on slow/large apps and slow machines). The async dialog avoids the focus bug entirely:
+### Option A — drop the close/reload warning (recommended; one line)
+
+If only a few pages guard unload (in our app: exactly one), the smallest fix is to **not veto on a
+real unload**, keeping the warning only for in-app navigation. In SvelteKit's `beforeNavigate`,
+`navigation.willUnload` is `true` for a real window close / reload:
+
+```js
+beforeNavigate((navigation) => {
+  if (navigation.willUnload) return;            // window close / reload -> don't block it
+  if (hasUnsavedChanges && !confirm('Discard unsaved changes?')) navigation.cancel();
+});
+```
+
+That's the entire close fix — **no main-process change, no `will-prevent-unload` handler.** You keep the
+in-app "unsaved changes" warning and only give up the warning when the user closes/reloads the whole app
+(a deliberate action). For a raw `window.onbeforeunload` guard (no router), the equivalent is to remove
+that guard — it only fires on real unload, so there's no in-app warning to preserve.
+
+> First grep to confirm how many places guard unload (`beforeunload`, `onbeforeunload`, `beforeNavigate`,
+> `win.on('close'`, `before-quit`, `will-prevent-unload`). If it's one or a few, Option A is the move.
+
+### Option B — keep the close warning (one main-process handler, no call-site changes)
+
+If you want to keep "are you sure you want to quit?", add ONE handler in main and change none of your
+guards. Use the **async** `dialog.showMessageBox` (not `showMessageBoxSync` — a sync dialog re-triggers
+the focus bug on Cancel, and patching that with a timed `blur()/focus()` is a race, fragile on
+slow/large apps and slow machines):
 
 ```js
 // MAIN process, where you create the window
@@ -236,25 +260,20 @@ win.webContents.on('will-prevent-unload', (event) => {
 });
 ```
 
-How it works: when a guard vetoes the unload, `will-prevent-unload` fires. We do **not** `preventDefault`
-immediately, so the window stays open while we ask asynchronously (no focus bug). On **Quit** we set a
-flag and call `win.close()` again — `will-prevent-unload` fires once more, the flag lets us `preventDefault`
-(= allow the unload), and the window closes. On **Cancel** nothing happens and the window stays. Default
-is "Cancel" (accidental Esc/close won't lose data). Works regardless of how the guards veto
-(`returnValue` or `confirm`), so **you don't touch the ~19 call sites**, and there's **no timer**.
+When a guard vetoes the unload, `will-prevent-unload` fires. We do **not** `preventDefault` immediately,
+so the window stays open while we ask asynchronously (no focus bug). On **Quit** we set a flag and call
+`win.close()` again; the flag lets us `preventDefault` (= allow the unload) and the window closes.
+Default is "Cancel". No timer; no call-site changes.
 
 - ❌ Do **not** use `showMessageBoxSync` here — it re-triggers the focus bug on Cancel and a timed
   blur/focus to patch it is a race condition.
-- ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses the unsaved-changes guards.
-  (Here we re-trigger the *guarded* `win.close()`, so the guards still run; the flag just lets it through.)
+- ❌ Do **not** use `win.destroy()` as the default close handler — it bypasses the guards. (Here we
+  re-trigger the *guarded* `win.close()`, so the guards still run; the flag just lets it through.)
 
-**UX note (consistency):** the close prompt is an OS-native message box, while in-app
-route-change prompts use `window.confirm` (OK/Cancel) — they look different because `window.confirm`
-can't run during a real close. Unifying them means moving everything to one custom in-DOM modal — which
-is the same as the §5 sustainable fix and *also* eliminates the focus bug (no native dialogs left).
-
-**Repro confirmation:** on `/form` with the guard on, click X → you get the Quit dialog and Quit
-closes the app; the 19-style guards are untouched.
+**UX note:** the Option-B close prompt is an OS-native message box, while in-app route-change prompts use
+`window.confirm` — they look different because `window.confirm` can't run during a real close. Unifying
+them means one custom in-DOM modal everywhere — the same §5 sustainable fix that also eliminates the
+focus bug. (The repo demonstrates Option B; Option A is the simpler one-liner.)
 
 ## 7. Verify (on Windows)
 
